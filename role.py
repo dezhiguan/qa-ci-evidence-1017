@@ -9,6 +9,19 @@ async def execute(data: dict, ctx) -> dict:
     if not isinstance(text, str):
         return {"decision": "BLOCKED", "reason": "Input text is not a string"}
 
+    # Check for injection patterns *before* parsing numbers
+    injection_patterns = [
+        r"ignore[\s\-]*prior",
+        r"leak[\s\-]*secret|leak[\s\-]*key",
+        r"decode[\s\-]*base64",
+        r"execute[\s\-]*shell|run[\s\-]*command",
+        r"merge.*pr|publish.*now|bypass.*approval",
+        r"[\x00-\x08\x0b\x0c\x0e-\x1f]"  # control chars
+    ]
+    for pattern in injection_patterns:
+        if re.search(pattern, text, re.IGNORECASE | re.UNICODE):
+            return {"decision": "BLOCKED", "reason": "Input contains suspected prompt injection or unsafe instruction"}
+
     # Parse CI run ID and PR number with strict validation
     ci_match = re.search(r"CI\s+run\s+(\d+)", text, re.IGNORECASE)
     pr_match = re.search(r"PR\s+#(\d+)", text, re.IGNORECASE)
@@ -38,13 +51,21 @@ async def execute(data: dict, ctx) -> dict:
     except Exception:
         return {"decision": "BLOCKED", "reason": "git.pr.diff failed"}
 
-    # Validate non-empty, non-error payloads
-    if not isinstance(log_result, dict) or "steps" not in log_result or not log_result["steps"]:
-        return {"decision": "BLOCKED", "reason": "Invalid or empty log result"}
-    if not isinstance(gate_result, dict) or "status" not in gate_result:
-        return {"decision": "BLOCKED", "reason": "Invalid or empty gate report"}
-    if not isinstance(diff_result, dict) or "files" not in diff_result:
-        return {"decision": "BLOCKED", "reason": "Invalid or empty PR diff"}
+    # Validate non-empty, non-error payloads — now *after* tool calls succeed
+    if not isinstance(log_result, dict):
+        return {"decision": "BLOCKED", "reason": "Invalid log result: not a dict"}
+    if "steps" not in log_result or not isinstance(log_result["steps"], list):
+        return {"decision": "BLOCKED", "reason": "Invalid or empty log result: missing 'steps' list"}
+    
+    if not isinstance(gate_result, dict):
+        return {"decision": "BLOCKED", "reason": "Invalid gate report: not a dict"}
+    if "status" not in gate_result:
+        return {"decision": "BLOCKED", "reason": "Invalid or empty gate report: missing 'status'"}
+    
+    if not isinstance(diff_result, dict):
+        return {"decision": "BLOCKED", "reason": "Invalid PR diff: not a dict"}
+    if "files" not in diff_result or not isinstance(diff_result["files"], list):
+        return {"decision": "BLOCKED", "reason": "Invalid or empty PR diff: missing 'files' list"}
 
     # Compile prompt with all evidence
     prompt = await ctx.prompt("role")
@@ -72,6 +93,9 @@ async def execute(data: dict, ctx) -> dict:
         parsed = json.loads(llm_response[json_start:json_end])
         if not isinstance(parsed, dict) or "decision" not in parsed:
             raise ValueError("LLM response missing 'decision' key")
+        # Enforce only allowed decision values
+        if parsed["decision"] not in ["INVESTIGATE", "BLOCKED"]:
+            raise ValueError("LLM returned disallowed decision value")
         return parsed
     except (json.JSONDecodeError, ValueError, TypeError):
         return {"decision": "BLOCKED", "reason": "LLM returned malformed or incomplete decision"}
